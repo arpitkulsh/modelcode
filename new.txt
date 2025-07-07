@@ -1,0 +1,101 @@
+# Step 1: Install required packages (run once)
+!pip install transformers safetensors torch onnx tf2onnx tensorflow pillow
+
+# Step 2: Import libraries
+import torch
+import numpy as np
+from transformers import AutoProcessor, AutoModel
+from safetensors import safe_open
+import onnx
+from tf2onnx import tf_loader
+import tensorflow as tf
+from PIL import Image
+
+# Step 3: Set model paths
+model_path = "./model"  # Local directory containing:
+                        # - model.safetensors
+                        # - config.json
+                        # - preprocessor_config.json
+
+# Step 4: Load model from local files
+state_dict = {}
+with safe_open(f"{model_path}/model.safetensors", framework="pt") as f:
+    for key in f.keys():
+        state_dict[key] = f.get_tensor(key)
+
+model = AutoModel.from_pretrained(model_path, state_dict=state_dict, local_files_only=True)
+processor = AutoProcessor.from_pretrained(model_path, local_files_only=True)
+
+# Step 5: Create combined model wrapper
+class SigLIPWrapper(torch.nn.Module):
+    def __init__(self, model):
+        super().__init__()
+        self.model = model
+        
+    def forward(self, pixel_values, input_ids, attention_mask):
+        # Get vision outputs
+        vision_outputs = self.model.vision_model(pixel_values=pixel_values)
+        image_embeds = vision_outputs[1]  # pooler_output
+        image_embeds = self.model.visual_projection(image_embeds)
+        
+        # Get text outputs
+        text_outputs = self.model.text_model(
+            input_ids=input_ids,
+            attention_mask=attention_mask
+        )
+        text_embeds = text_outputs[1]  # pooler_output
+        text_embeds = self.model.text_projection(text_embeds)
+        
+        return image_embeds, text_embeds
+
+wrapped_model = SigLIPWrapper(model).eval()
+
+# Step 6: Prepare dummy inputs using processor
+text = ["a photo of a cat"]  # Example text
+image = Image.new('RGB', (224, 224), color='red')  # Dummy image
+
+inputs = processor(
+    text=text,
+    images=image,
+    padding="max_length",
+    max_length=64,
+    return_tensors="pt",
+    truncation=True
+)
+
+# Step 7: Export to ONNX
+torch.onnx.export(
+    wrapped_model,
+    (inputs.pixel_values, inputs.input_ids, inputs.attention_mask),
+    "siglip_combined.onnx",
+    input_names=["pixel_values", "input_ids", "attention_mask"],
+    output_names=["image_embeds", "text_embeds"],
+    dynamic_axes={
+        "pixel_values": {0: "batch_size"},
+        "input_ids": {0: "batch_size"},
+        "attention_mask": {0: "batch_size"},
+        "image_embeds": {0: "batch_size"},
+        "text_embeds": {0: "batch_size"}
+    },
+    opset_version=14,
+    do_constant_folding=True
+)
+
+# Step 8: Convert ONNX to TensorFlow
+onnx_model = onnx.load("siglip_combined.onnx")
+tf_rep = tf_loader.prepare(onnx_model, name="SigLIP")
+
+# Step 9: Convert to TFLite
+converter = tf.lite.TFLiteConverter.from_saved_model(tf_rep.path)
+converter.optimizations = [tf.lite.Optimize.DEFAULT]
+converter.target_spec.supported_ops = [
+    tf.lite.OpsSet.TFLITE_BUILTINS,
+    tf.lite.OpsSet.SELECT_TF_OPS
+]
+tflite_model = converter.convert()
+
+# Step 10: Save TFLite model
+with open("siglip_combined.tflite", "wb") as f:
+    f.write(tflite_model)
+
+print("Conversion successful! TFLite model saved as siglip_combined.tflite")
