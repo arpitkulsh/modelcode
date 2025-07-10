@@ -1,4 +1,4 @@
-# SigLIP to TFLite Conversion with Nobuco (Fixed Layer.add_weight() error)
+# SigLIP to TFLite Conversion with Nobuco (Fixed for v0.8.1)
 # Tested with Python 3.10, TensorFlow 2.19.0, and Nobuco 0.8.1
 
 # Step 1: Install required packages
@@ -17,8 +17,7 @@ import os
 import nobuco
 from nobuco import ChannelOrder, ChannelOrderingStrategy
 from nobuco.converters.node_converter import converter
-from nobuco.converters.tensor import get_tensor_shape
-from nobuco.converters.weight import WeightConverter
+from nobuco.util import get_tensor_shape  # FIXED IMPORT
 from nobuco.layers.weight import WeightLayer
 import warnings
 
@@ -127,43 +126,44 @@ with safe_open(safetensor_path, framework="pt") as f:
 dummy_pixel_values = torch.randn(1, 3, 256, 256)
 dummy_input_ids = torch.ones(1, 64, dtype=torch.long)
 
-# Step 9: Custom weight converters to fix Layer.add_weight() error
+# Step 9: Custom converters for Linear and LayerNorm
 # =================================================================
-# Fix for "Layer.add_weight() got multiple values for argument shape"
+# FIXED: Proper converters using WeightLayer for Nobuco 0.8.1
 
-class FixedLinearWeightConverter(WeightConverter):
-    def __init__(self):
-        super().__init__()
-
-    def convert(self, node, weights, weight_name, weight_value):
-        # For linear layers
-        weight_layer = WeightLayer(
-            name=weight_name,
-            shape=weight_value.shape,
-            dtype=weight_value.dtype,
-            trainable=False
+@converter(nn.Linear)
+def convert_Linear(self, input, *args, **kwargs):
+    weight = self.weight.detach().numpy().T
+    bias = self.bias.detach().numpy() if self.bias is not None else None
+    
+    def func(input, weight=weight, bias=bias):
+        # Create Keras dense layer with pre-set weights
+        layer = tf.keras.layers.Dense(
+            units=weight.shape[1],
+            use_bias=(bias is not None),
+            kernel_initializer=tf.keras.initializers.Constant(weight),
+            bias_initializer=tf.keras.initializers.Constant(bias) if bias is not None else None
         )
-        weight_layer.set_weights([weight_value])
-        return weight_layer
+        return layer(input)
+    return func
 
-class FixedLayerNormWeightConverter(WeightConverter):
-    def __init__(self):
-        super().__init__()
-
-    def convert(self, node, weights, weight_name, weight_value):
-        # For LayerNorm layers
-        weight_layer = WeightLayer(
-            name=weight_name,
-            shape=weight_value.shape,
-            dtype=weight_value.dtype,
-            trainable=False
+@converter(nn.LayerNorm)
+def convert_LayerNorm(self, input, *args, **kwargs):
+    weight = self.weight.detach().numpy() if self.weight is not None else None
+    bias = self.bias.detach().numpy() if self.bias is not None else None
+    eps = self.eps
+    
+    def func(input, weight=weight, bias=bias, eps=eps):
+        # Create Keras layer norm with pre-set weights
+        layer = tf.keras.layers.LayerNormalization(
+            axis=-1,
+            epsilon=eps,
+            gamma_initializer=tf.keras.initializers.Constant(weight) if weight is not None else None,
+            beta_initializer=tf.keras.initializers.Constant(bias) if bias is not None else None,
+            center=(bias is not None),
+            scale=(weight is not None)
         )
-        weight_layer.set_weights([weight_value])
-        return weight_layer
-
-# Register custom converters
-nobuco.converters.weight.WEIGHT_CONVERTERS[nn.Linear] = FixedLinearWeightConverter()
-nobuco.converters.weight.WEIGHT_CONVERTERS[nn.LayerNorm] = FixedLayerNormWeightConverter()
+        return layer(input)
+    return func
 
 # Workaround for TensorFlow 2.19 compatibility
 @converter(torch.Tensor.size, channel_ordering_strategy=ChannelOrderingStrategy.MINIMUM_TRANSPOSITIONS)
@@ -172,8 +172,8 @@ def converter_size(input, *args, **kwargs):
         return input.shape
     return func
 
-# Step 10: Convert to Keras using Nobuco with custom converters
-print("Starting Nobuco conversion with custom weight converters...")
+# Step 10: Convert to Keras using Nobuco
+print("Starting Nobuco conversion with custom converters...")
 
 try:
     keras_model = nobuco.pytorch_to_keras(
@@ -286,5 +286,4 @@ except Exception as e:
     print("2. Reduce model complexity by removing LayerNorm operations")
     print("3. Try quantizing the model:")
     print("   converter.optimizations = [tf.lite.Optimize.DEFAULT]")
-    print("   converter.target_spec.supported_types = [tf.float16]")
-    print("4. Open an issue on the Nobuco GitHub repository")
+    print("   converter
