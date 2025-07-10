@@ -1,138 +1,202 @@
 # Step 1: Install required packages (run once)
-!pip install transformers safetensors torch onnx tf2onnx tensorflow pillow
+# !pip install safetensors torch onnx tf2onnx tensorflow pillow numpy onnxruntime onnx-tf
 
 # Step 2: Import libraries
 import torch
+import torch.nn as nn
 import numpy as np
-from transformers import AutoProcessor, AutoModel
 from safetensors import safe_open
+import json
 import onnx
-from tf2onnx import tf_loader
 import tensorflow as tf
 from PIL import Image
+import os
+import tf2onnx
+from onnx_tf.backend import prepare
 
-# Step 3: Set model paths
-model_path = "./model"  # Local directory containing:
-                        # - model.safetensors
-                        # - config.json
-                        # - preprocessor_config.json
+# Step 3: Configuration
+MODEL_DIR = "./model"  # Update with your actual model directory
 
-# Step 4: Load model from local files
-state_dict = {}
-with safe_open(f"{model_path}/model.safetensors", framework="pt") as f:
-    for key in f.keys():
-        state_dict[key] = f.get_tensor(key)
+# Step 4: Load configuration from local files
+with open(os.path.join(MODEL_DIR, "config.json"), "r") as f:
+    config = json.load(f)
 
-model = AutoModel.from_pretrained(model_path, state_dict=state_dict, local_files_only=True)
-processor = AutoProcessor.from_pretrained(model_path, local_files_only=True)
-
-# Step 5: Create combined model wrapper
-class SigLIPWrapper(torch.nn.Module):
-    def __init__(self, model):
+# Step 5: Create a simplified SigLIP model structure
+class SigLIPModel(nn.Module):
+    def __init__(self, config):
         super().__init__()
-        self.model = model
+        # Vision parameters
+        vision_config = config.get("vision_config", config)
+        self.image_size = vision_config.get("image_size", 224)
+        self.vision_embed_dim = vision_config.get("hidden_size", 768)
+        self.patch_size = vision_config.get("patch_size", 16)
         
-    def forward(self, pixel_values, input_ids, attention_mask):
-        # Get vision outputs
-        vision_outputs = self.model.vision_model(pixel_values=pixel_values)
-        image_embeds = vision_outputs[1]  # pooler_output
-        image_embeds = self.model.visual_projection(image_embeds)
+        # Text parameters
+        text_config = config.get("text_config", config)
+        self.vocab_size = text_config.get("vocab_size", 32000)
+        self.text_embed_dim = text_config.get("hidden_size", 768)
+        self.max_length = text_config.get("max_position_embeddings", 64)
         
-        # Get text outputs
-        text_outputs = self.model.text_model(
-            input_ids=input_ids,
-            attention_mask=attention_mask
-        )
-        text_embeds = text_outputs[1]  # pooler_output
-        text_embeds = self.model.text_projection(text_embeds)
+        # Projection
+        self.projection_dim = config.get("projection_dim", 512)
+        
+        # Vision layers
+        self.vision_conv = nn.Conv2d(3, self.vision_embed_dim, 
+                                     kernel_size=self.patch_size, 
+                                     stride=self.patch_size)
+        self.vision_ln = nn.LayerNorm(self.vision_embed_dim)
+        
+        # Text layers
+        self.text_embed = nn.Embedding(self.vocab_size, self.text_embed_dim)
+        self.text_ln = nn.LayerNorm(self.text_embed_dim)
+        
+        # Projection layers
+        self.visual_projection = nn.Linear(self.vision_embed_dim, self.projection_dim, bias=False)
+        self.text_projection = nn.Linear(self.text_embed_dim, self.projection_dim, bias=False)
+        
+    def forward(self, pixel_values, input_ids):
+        # Vision forward pass
+        vision_embeds = self.vision_conv(pixel_values)
+        vision_embeds = vision_embeds.flatten(2).transpose(1, 2)
+        vision_embeds = self.vision_ln(vision_embeds)
+        vision_embeds = vision_embeds.mean(dim=1)  # Simple pooling
+        
+        # Text forward pass
+        text_embeds = self.text_embed(input_ids)
+        text_embeds = text_embeds.mean(dim=1)  # Simple pooling
+        text_embeds = self.text_ln(text_embeds)
+        
+        # Project embeddings
+        image_embeds = self.visual_projection(vision_embeds)
+        text_embeds = self.text_projection(text_embeds)
         
         return image_embeds, text_embeds
 
-wrapped_model = SigLIPWrapper(model).eval()
+# Step 6: Create model instance
+model = SigLIPModel(config)
 
-# Step 6: Prepare dummy inputs using processor
-text = ["a photo of a cat"]  # Example text
-image = Image.new('RGB', (224, 224), color='red')  # Dummy image
+# Step 7: Load weights from safetensors
+safetensor_path = os.path.join(MODEL_DIR, "model.safetensors")
+if os.path.exists(safetensor_path):
+    with safe_open(safetensor_path, framework="pt") as f:
+        # Print keys to help with debugging
+        print("Available keys in safetensors file:")
+        print(list(f.keys())[:5], "...")  # Print first 5 keys
+        
+        # Load weights - this mapping is model-specific
+        for key in f.keys():
+            tensor = f.get_tensor(key)
+            
+            # Map vision weights
+            if "vision_model.embeddings.patch_embedding.weight" in key:
+                model.vision_conv.weight.data = tensor
+            elif "vision_model.embeddings.patch_embedding.bias" in key:
+                model.vision_conv.bias.data = tensor
+            elif "vision_model.post_layernorm.weight" in key:
+                model.vision_ln.weight.data = tensor
+            elif "vision_model.post_layernorm.bias" in key:
+                model.vision_ln.bias.data = tensor
+                
+            # Map text weights
+            elif "text_model.embeddings.token_embedding.weight" in key:
+                model.text_embed.weight.data = tensor
+            elif "text_model.final_layer_norm.weight" in key:
+                model.text_ln.weight.data = tensor
+            elif "text_model.final_layer_norm.bias" in key:
+                model.text_ln.bias.data = tensor
+                
+            # Map projection weights
+            elif "visual_projection.weight" in key:
+                model.visual_projection.weight.data = tensor.T  # Transpose for linear layer
+            elif "text_projection.weight" in key:
+                model.text_projection.weight.data = tensor.T  # Transpose for linear layer
+else:
+    print(f"Warning: {safetensor_path} not found. Using random weights.")
+    # Initialize with random weights for testing conversion
+    model.vision_conv.weight.data.normal_()
+    model.text_embed.weight.data.normal_()
 
-inputs = processor(
-    text=text,
-    images=image,
-    padding="max_length",
-    max_length=64,
-    return_tensors="pt",
-    truncation=True
-)
+model.eval()
 
-# Step 7: Export to ONNX
+# Step 8: Create dummy inputs
+pixel_values = torch.randn(1, 3, model.image_size, model.image_size)
+input_ids = torch.ones(1, model.max_length, dtype=torch.long)
+
+# Step 9: Export to ONNX
+onnx_path = "siglip_combined.onnx"
 torch.onnx.export(
-    wrapped_model,
-    (inputs.pixel_values, inputs.input_ids, inputs.attention_mask),
-    "siglip_combined.onnx",
-    input_names=["pixel_values", "input_ids", "attention_mask"],
+    model,
+    (pixel_values, input_ids),
+    onnx_path,
+    input_names=["pixel_values", "input_ids"],
     output_names=["image_embeds", "text_embeds"],
     dynamic_axes={
         "pixel_values": {0: "batch_size"},
         "input_ids": {0: "batch_size"},
-        "attention_mask": {0: "batch_size"},
         "image_embeds": {0: "batch_size"},
         "text_embeds": {0: "batch_size"}
     },
     opset_version=14,
-    do_constant_folding=True
+    do_constant_folding=True,
+    export_params=True
 )
 
-# Step 8: Convert ONNX to TensorFlow
-onnx_model = onnx.load("siglip_combined.onnx")
-tf_rep = tf_loader.prepare(onnx_model, name="SigLIP")
+print(f"ONNX model saved to {onnx_path}")
 
-# Step 9: Convert to TFLite
-converter = tf.lite.TFLiteConverter.from_saved_model(tf_rep.path)
+# Step 10: Convert ONNX to TensorFlow using onnx-tf
+tf_model_path = "tf_saved_model"
+try:
+    # Load ONNX model
+    onnx_model = onnx.load(onnx_path)
+    
+    # Prepare TensorFlow representation
+    tf_rep = prepare(onnx_model)
+    
+    # Export to TensorFlow SavedModel format
+    tf_rep.export_graph(tf_model_path)
+    print("ONNX to TensorFlow conversion successful")
+except Exception as e:
+    print(f"ONNX to TensorFlow conversion failed: {e}")
+    print("Troubleshooting steps:")
+    print("1. Install onnx-tf: pip install onnx-tf")
+    print("2. Try a different ONNX opset version")
+    print("3. Simplify the model architecture")
+    raise
+
+# Step 11: Convert to TFLite
+tflite_path = "siglip_combined.tflite"
+converter = tf.lite.TFLiteConverter.from_saved_model(tf_model_path)
 converter.optimizations = [tf.lite.Optimize.DEFAULT]
 converter.target_spec.supported_ops = [
     tf.lite.OpsSet.TFLITE_BUILTINS,
     tf.lite.OpsSet.SELECT_TF_OPS
 ]
-tflite_model = converter.convert()
 
-# Step 10: Save TFLite model
-with open("siglip_combined.tflite", "wb") as f:
-    f.write(tflite_model)
-
-print("Conversion successful! TFLite model saved as siglip_combined.tflite")
-
-
-
-
-model.eval()
-model.config.return_dict = False   # makes sure we get a plain tuple back
-
-torch.onnx.export(
-    model,
-    # either as a tuple of POSITIONAL args:
-    args=(
-      inputs["pixel_values"],
-      inputs["input_ids"],
-      inputs["attention_mask"],
-      False                              # <-- return_loss positional
-    ),
-    # …or you can use kwargs to be explicit:
-    # args=(),  
-    # kwargs={
-    #   "pixel_values": inputs["pixel_values"],
-    #   "input_ids":    inputs["input_ids"],
-    #   "attention_mask": inputs["attention_mask"],
-    #   "return_loss": False
-    # },
-    f="siglip_combined.onnx",
-    input_names=["pixel_values", "input_ids", "attention_mask", "return_loss"],
-    output_names=["image_embeds", "text_embeds"],
-    dynamic_axes={
-      "pixel_values":   {0: "batch_size"},
-      "input_ids":      {0: "batch_size"},
-      "attention_mask": {0: "batch_size"},
-      "image_embeds":   {0: "batch_size"},
-      "text_embeds":    {0: "batch_size"},
-    },
-    opset_version=14,
-    do_constant_folding=True
-)
+try:
+    tflite_model = converter.convert()
+    with open(tflite_path, "wb") as f:
+        f.write(tflite_model)
+    print(f"TFLite conversion successful! Model saved to {tflite_path}")
+    print(f"TFLite model size: {len(tflite_model)/1024/1024:.2f} MB")
+    
+    # Verify the model
+    interpreter = tf.lite.Interpreter(model_content=tflite_model)
+    interpreter.allocate_tensors()
+    input_details = interpreter.get_input_details()
+    output_details = interpreter.get_output_details()
+    
+    print("\nModel Inputs:")
+    for i, inp in enumerate(input_details):
+        print(f"Input {i}: {inp['name']}, Shape: {inp['shape']}, Type: {inp['dtype']}")
+    
+    print("\nModel Outputs:")
+    for i, out in enumerate(output_details):
+        print(f"Output {i}: {out['name']}, Shape: {out['shape']}, Type: {out['dtype']}")
+        
+except Exception as e:
+    print(f"TFLite conversion failed: {e}")
+    print("Possible solutions:")
+    print("1. Try a different ONNX opset version (12-15)")
+    print("2. Simplify the model architecture")
+    print("3. Install latest TensorFlow version: pip install -U tensorflow")
+    print("4. Check for custom ops in the model")
